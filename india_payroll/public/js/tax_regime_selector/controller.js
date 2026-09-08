@@ -86,7 +86,12 @@ export class TaxRegimeSelector {
 		this.annual_gross_control.refresh();
 
 		this.fetch_payroll_period();
-		frappe.call({ method: `${METHOD}.setup_if_missing` });
+		if (
+			frappe.model.can_create("Income Tax Slab") &&
+			frappe.model.can_create("Employee Tax Exemption Category")
+		) {
+			frappe.call({ method: `${METHOD}.setup_if_missing` });
+		}
 
 		// Default to the logged-in user's employee, if any.
 		window.hrms?.get_current_employee?.().then((employee) => {
