@@ -41,9 +41,83 @@ SECTION_CAPS = {
 }
 
 
+def validate_tax_master_access() -> None:
+	"""Both setup paths insert with ignore_permissions, so confirm the caller may
+	create the records they create."""
+	if frappe.has_permission("Income Tax Slab", "create") and frappe.has_permission(
+		"Employee Tax Exemption Category", "create"
+	):
+		return
+
+	frappe.throw(
+		frappe._(
+			"Income Tax Slab and Employee Tax Exemption Category are not set up. Ask an HR Manager to open the Tax Regime Selector once to create them."
+		),
+		frappe.PermissionError,
+		title=frappe._("Not Permitted"),
+	)
+
+
+def validate_employee_access(employee: str, ptype: str = "read") -> None:
+	"""Allow an employee to act on their own tax regime. Any other caller needs
+	`ptype` permission on that employee's Salary Structure Assignment."""
+	if not employee:
+		frappe.throw(frappe._("Employee is required"))
+
+	if not frappe.db.exists("Employee", employee):
+		frappe.throw(frappe._("Employee {0} not found").format(employee), frappe.DoesNotExistError)
+
+	if frappe.session.user == frappe.db.get_value("Employee", employee, "user_id"):
+		return
+
+	frappe.has_permission("Employee", "read", doc=employee, throw=True)
+
+	assignment = get_latest_assignment(employee)
+	frappe.has_permission(
+		"Salary Structure Assignment",
+		ptype,
+		doc=assignment.name if assignment else None,
+		throw=True,
+	)
+
+
+def validate_income_tax_slab(assignment: str, income_tax_slab: str) -> None:
+	"""Repeat the Salary Structure Assignment's own slab checks, since writing the
+	field directly skips them."""
+	if not income_tax_slab:
+		frappe.throw(frappe._("Income Tax Slab is required"))
+
+	slab = frappe.db.get_value(
+		"Income Tax Slab",
+		income_tax_slab,
+		["docstatus", "disabled", "currency", "company"],
+		as_dict=True,
+	)
+	if not slab:
+		frappe.throw(frappe._("Income Tax Slab {0} not found").format(income_tax_slab))
+	if slab.docstatus != 1:
+		frappe.throw(frappe._("Income Tax Slab {0} is not submitted").format(income_tax_slab))
+	if slab.disabled:
+		frappe.throw(frappe._("Income Tax Slab {0} is disabled").format(income_tax_slab))
+
+	ssa = frappe.db.get_value(
+		"Salary Structure Assignment", assignment, ["company", "currency"], as_dict=True
+	)
+	if slab.company and slab.company != ssa.company:
+		frappe.throw(
+			frappe._("Income Tax Slab {0} belongs to company {1}").format(income_tax_slab, slab.company)
+		)
+	if slab.currency != ssa.currency:
+		frappe.throw(
+			frappe._("Currency of Income Tax Slab {0} should be {1}").format(income_tax_slab, ssa.currency)
+		)
+
+
 @frappe.whitelist()
 def setup_if_missing() -> dict:
 	"""Idempotently create income tax slabs and exemption categories."""
+	validate_tax_master_access()
+
 	from india_payroll.install import create_income_tax_slabs
 
 	create_income_tax_slabs()
@@ -55,6 +129,8 @@ def setup_if_missing() -> dict:
 
 @frappe.whitelist()
 def get_employee_details(employee: str) -> dict:
+	validate_employee_access(employee)
+
 	data = get_employee_salary_data(employee)
 
 	categories = frappe.get_all(
@@ -62,6 +138,7 @@ def get_employee_details(employee: str) -> dict:
 		fields=["name", "max_amount", "description"],
 	)
 	if not categories:
+		validate_tax_master_access()
 		setup_tax_exemption_categories()
 		categories = frappe.get_all(
 			"Employee Tax Exemption Category",
@@ -155,6 +232,8 @@ def compute_tax_comparison(
 	city_type: str = "non-metro",
 	annual_gross: float = 0,
 ) -> dict:
+	validate_employee_access(employee)
+
 	if isinstance(declarations, str):
 		declarations = frappe.parse_json(declarations)
 
@@ -193,11 +272,9 @@ def compute_tax_comparison(
 
 
 def get_latest_assignment(employee):
-	"""Latest Salary Structure Assignment for the employee, regardless of docstatus
-	(draft or submitted). Returns the {name, docstatus} dict or None."""
 	return frappe.db.get_value(
 		"Salary Structure Assignment",
-		{"employee": employee},
+		{"employee": employee, "docstatus": ("<", 2)},
 		["name", "docstatus"],
 		order_by="from_date desc, creation desc",
 		as_dict=True,
@@ -206,19 +283,24 @@ def get_latest_assignment(employee):
 
 @frappe.whitelist()
 def set_tax_regime(employee: str, income_tax_slab: str) -> dict:
+	validate_employee_access(employee, "write")
+
 	assignment = get_latest_assignment(employee)
 	if not assignment:
 		frappe.throw(frappe._("No Salary Structure Assignment found for {0}").format(employee))
 	if assignment.docstatus == 1:
 		frappe.throw(frappe._("Salary Structure Assignment {0} is already submitted").format(assignment.name))
+
+	validate_income_tax_slab(assignment.name, income_tax_slab)
+
 	frappe.db.set_value("Salary Structure Assignment", assignment.name, "income_tax_slab", income_tax_slab)
 	return {"assignment": assignment.name}
 
 
 @frappe.whitelist()
 def notify_employee_to_select_tax_regime(assignment: str) -> dict:
-	"""Email the employee on this Salary Structure Assignment a prompt to pick
-	their tax regime in the Tax Regime Selector page."""
+	frappe.has_permission("Salary Structure Assignment", "email", throw=True)
+
 	ssa = frappe.db.get_value(
 		"Salary Structure Assignment",
 		assignment,
@@ -227,6 +309,8 @@ def notify_employee_to_select_tax_regime(assignment: str) -> dict:
 	)
 	if not ssa:
 		frappe.throw(frappe._("Salary Structure Assignment {0} not found").format(assignment))
+
+	frappe.has_permission("Salary Structure Assignment", "email", doc=assignment, throw=True)
 
 	emails = frappe.db.get_value(
 		"Employee",
@@ -261,6 +345,8 @@ def notify_employee_to_select_tax_regime(assignment: str) -> dict:
 def notify_employees_to_select_tax_regime(names: str | list[str]) -> dict:
 	"""Bulk version of notify_employee_to_select_tax_regime for the SSA list view.
 	Notifies only draft assignments; skips submitted ones and those without an email."""
+	frappe.has_permission("Salary Structure Assignment", "email", throw=True)
+
 	if isinstance(names, str):
 		names = frappe.parse_json(names)
 
