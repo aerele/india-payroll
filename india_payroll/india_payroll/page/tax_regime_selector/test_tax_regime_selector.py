@@ -4,6 +4,7 @@
 import frappe
 from erpnext.setup.doctype.employee.test_employee import make_employee
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+from frappe.permissions import add_user_permission, reset_perms, update_permission_property
 from hrms.payroll.doctype.salary_structure.test_salary_structure import (
 	create_salary_structure_assignment,
 	make_salary_structure,
@@ -17,7 +18,9 @@ from india_payroll.india_payroll.page.tax_regime_selector.tax_regime_selector im
 	compute_tax_comparison,
 	get_employee_details,
 	get_employee_salary_data,
+	notify_employee_to_select_tax_regime,
 	set_tax_regime,
+	setup_if_missing,
 )
 from india_payroll.india_payroll.tax_exemption_setup import setup_tax_exemption_categories
 from india_payroll.install import create_income_tax_slabs, get_custom_fields
@@ -86,11 +89,90 @@ def make_structure(employee, base, from_date="2026-04-01"):
 	return structure
 
 
+def make_draft_assignment(employee, base=100000, income_tax_slab=OLD_REGIME_SLAB):
+	"""Structure without an employee, then a draft assignment for that employee."""
+	ensure_salary_components()
+	make_salary_structure(
+		"IP Tax Regime Test Structure",
+		"Monthly",
+		company=COMPANY,
+		currency="INR",
+		earnings=EARNINGS,
+		deductions=DEDUCTIONS,
+	)
+	return frappe.get_doc(
+		{
+			"doctype": "Salary Structure Assignment",
+			"employee": employee,
+			"salary_structure": "IP Tax Regime Test Structure",
+			"from_date": "2026-04-01",
+			"base": base,
+			"company": COMPANY,
+			"currency": "INR",
+			"income_tax_slab": income_tax_slab,
+		}
+	).insert()
+
+
+def make_cancelled_assignment(employee, from_date):
+	ensure_salary_components()
+	make_salary_structure(
+		"IP Tax Regime Test Structure",
+		"Monthly",
+		company=COMPANY,
+		currency="INR",
+		earnings=EARNINGS,
+		deductions=DEDUCTIONS,
+	)
+	ssa = frappe.get_doc(
+		{
+			"doctype": "Salary Structure Assignment",
+			"employee": employee,
+			"salary_structure": "IP Tax Regime Test Structure",
+			"from_date": from_date,
+			"base": 100000,
+			"company": COMPANY,
+			"currency": "INR",
+			"income_tax_slab": OLD_REGIME_SLAB,
+		}
+	).insert()
+	ssa.submit()
+	ssa.cancel()
+	return ssa
+
+
+def ensure_self_user_permission(employee):
+	"""ERPNext adds this on Employee insert; assert it so a permission test that
+	depends on it fails loudly rather than silently passing."""
+	user = frappe.db.get_value("Employee", employee, "user_id")
+	if not frappe.db.exists("User Permission", {"allow": "Employee", "for_value": employee, "user": user}):
+		add_user_permission("Employee", employee, user, ignore_permissions=True)
+	return user
+
+
+def make_hr_user(email="ip_trs_hr@indiapayroll.com"):
+	if not frappe.db.exists("User", email):
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": email,
+				"first_name": "IP TRS HR",
+				"send_welcome_email": 0,
+				"roles": [{"doctype": "Has Role", "role": "HR Manager"}],
+			}
+		).insert(ignore_permissions=True)
+	return email
+
+
 class TestTaxRegimeSelector(HRMSTestSuite):
 	def setUp(self):
+		frappe.set_user("Administrator")
 		create_custom_fields(get_custom_fields())
 		create_income_tax_slabs()
 		setup_tax_exemption_categories()
+
+	def tearDown(self):
+		frappe.set_user("Administrator")
 
 	def test_annual_gross_sourced_from_assignment(self):
 		"""get_employee_salary_data reads the SSA's computed annual_gross_earning."""
@@ -192,31 +274,155 @@ class TestTaxRegimeSelector(HRMSTestSuite):
 
 	def test_set_tax_regime_allowed_when_draft(self):
 		employee = make_employee("ip_trs_draft@indiapayroll.com", company=COMPANY)
-		ensure_salary_components()
-		# Structure only (no auto-assignment), then a DRAFT assignment.
-		make_salary_structure(
-			"IP Tax Regime Test Structure",
-			"Monthly",
-			company=COMPANY,
-			currency="INR",
-			earnings=EARNINGS,
-			deductions=DEDUCTIONS,
-		)
-		ssa = frappe.get_doc(
-			{
-				"doctype": "Salary Structure Assignment",
-				"employee": employee,
-				"salary_structure": "IP Tax Regime Test Structure",
-				"from_date": "2026-04-01",
-				"base": 100000,
-				"company": COMPANY,
-				"currency": "INR",
-				"income_tax_slab": OLD_REGIME_SLAB,
-			}
-		).insert()  # draft (docstatus 0)
+		ssa = make_draft_assignment(employee)
 
 		result = set_tax_regime(employee, NEW_REGIME_SLAB)
 		self.assertEqual(result["assignment"], ssa.name)
+		self.assertEqual(
+			frappe.db.get_value("Salary Structure Assignment", ssa.name, "income_tax_slab"),
+			NEW_REGIME_SLAB,
+		)
+
+	def test_cancelled_assignment_is_skipped(self):
+		"""A cancelled assignment can hold the latest from_date. get_latest_assignment
+		must skip it and return the draft instead of writing to a cancelled document."""
+		employee = make_employee("ip_trs_cancelled@indiapayroll.com", company=COMPANY)
+		draft = make_draft_assignment(employee)
+		cancelled = make_cancelled_assignment(employee, "2026-07-01")
+
+		result = set_tax_regime(employee, NEW_REGIME_SLAB)
+
+		self.assertEqual(result["assignment"], draft.name)
+		self.assertEqual(
+			frappe.db.get_value("Salary Structure Assignment", cancelled.name, "income_tax_slab"),
+			OLD_REGIME_SLAB,
+		)
+
+	def test_only_cancelled_assignment_reports_none_found(self):
+		employee = make_employee("ip_trs_only_cancelled@indiapayroll.com", company=COMPANY)
+		make_cancelled_assignment(employee, "2026-04-01")
+
+		self.assertRaises(frappe.ValidationError, set_tax_regime, employee, NEW_REGIME_SLAB)
+
+	def test_set_tax_regime_rejects_unknown_slab(self):
+		employee = make_employee("ip_trs_badslab@indiapayroll.com", company=COMPANY)
+		ssa = make_draft_assignment(employee)
+
+		self.assertRaises(frappe.ValidationError, set_tax_regime, employee, "Not A Real Slab")
+		self.assertEqual(
+			frappe.db.get_value("Salary Structure Assignment", ssa.name, "income_tax_slab"),
+			OLD_REGIME_SLAB,
+		)
+
+	def test_set_tax_regime_allowed_for_own_employee(self):
+		"""Self-service: the Employee role has no write permission on the assignment,
+		so the employee's own user must still be allowed through."""
+		employee = make_employee("ip_trs_self@indiapayroll.com", company=COMPANY)
+		ssa = make_draft_assignment(employee)
+		user = ensure_self_user_permission(employee)
+
+		frappe.set_user(user)
+		set_tax_regime(employee, NEW_REGIME_SLAB)
+
+		frappe.set_user("Administrator")
+		self.assertEqual(
+			frappe.db.get_value("Salary Structure Assignment", ssa.name, "income_tax_slab"),
+			NEW_REGIME_SLAB,
+		)
+
+	def test_set_tax_regime_blocked_for_other_employee(self):
+		attacker = make_employee("ip_trs_attacker@indiapayroll.com", company=COMPANY)
+		victim = make_employee("ip_trs_victim@indiapayroll.com", company=COMPANY)
+		make_draft_assignment(attacker)
+		victim_ssa = make_draft_assignment(victim)
+		attacker_user = ensure_self_user_permission(attacker)
+		ensure_self_user_permission(victim)
+
+		frappe.set_user(attacker_user)
+		self.assertRaises(frappe.PermissionError, set_tax_regime, victim, NEW_REGIME_SLAB)
+
+		frappe.set_user("Administrator")
+		self.assertEqual(
+			frappe.db.get_value("Salary Structure Assignment", victim_ssa.name, "income_tax_slab"),
+			OLD_REGIME_SLAB,
+		)
+
+	def test_read_endpoints_blocked_for_other_employee(self):
+		attacker = make_employee("ip_trs_reader@indiapayroll.com", company=COMPANY)
+		victim = make_employee("ip_trs_read_victim@indiapayroll.com", company=COMPANY)
+		make_draft_assignment(attacker)
+		make_draft_assignment(victim)
+		attacker_user = ensure_self_user_permission(attacker)
+		ensure_self_user_permission(victim)
+
+		frappe.set_user(attacker_user)
+		self.assertRaises(frappe.PermissionError, get_employee_details, victim)
+		self.assertRaises(frappe.PermissionError, compute_tax_comparison, victim, {})
+
+		# own record still readable
+		self.assertTrue(get_employee_details(attacker)["annual_gross"])
+
+	def test_notify_blocked_for_employee_role(self):
+		attacker = make_employee("ip_trs_notify_attacker@indiapayroll.com", company=COMPANY)
+		victim = make_employee("ip_trs_notify_victim@indiapayroll.com", company=COMPANY)
+		make_draft_assignment(attacker)
+		victim_ssa = make_draft_assignment(victim)
+		attacker_user = ensure_self_user_permission(attacker)
+
+		frappe.set_user(attacker_user)
+		self.assertRaises(frappe.PermissionError, notify_employee_to_select_tax_regime, victim_ssa.name)
+
+	def test_self_service_works_without_assignment_permission(self):
+		"""Most sites give the Employee role no access to Salary Structure Assignment.
+		Self-service must still work, because the guard matches user_id before it
+		checks permissions. Cross-employee access must stay blocked."""
+		employee = make_employee("ip_trs_noperm@indiapayroll.com", company=COMPANY)
+		victim = make_employee("ip_trs_noperm_victim@indiapayroll.com", company=COMPANY)
+		ssa = make_draft_assignment(employee)
+		make_draft_assignment(victim)
+		user = ensure_self_user_permission(employee)
+
+		try:
+			update_permission_property("Salary Structure Assignment", "Employee", 0, "select", 0)
+			update_permission_property("Salary Structure Assignment", "Employee", 0, "read", 0)
+			frappe.clear_cache()
+
+			frappe.set_user(user)
+			self.assertFalse(frappe.has_permission("Salary Structure Assignment", "read"))
+
+			self.assertTrue(get_employee_details(employee)["annual_gross"])
+			set_tax_regime(employee, NEW_REGIME_SLAB)
+
+			self.assertRaises(frappe.PermissionError, get_employee_details, victim)
+			self.assertRaises(frappe.PermissionError, set_tax_regime, victim, NEW_REGIME_SLAB)
+		finally:
+			frappe.set_user("Administrator")
+			reset_perms("Salary Structure Assignment")
+			frappe.clear_cache()
+
+		self.assertEqual(
+			frappe.db.get_value("Salary Structure Assignment", ssa.name, "income_tax_slab"),
+			NEW_REGIME_SLAB,
+		)
+
+	def test_setup_if_missing_blocked_for_employee_role(self):
+		employee = make_employee("ip_trs_setup@indiapayroll.com", company=COMPANY)
+		user = ensure_self_user_permission(employee)
+		self.assertTrue(setup_if_missing()["ok"])
+
+		frappe.set_user(user)
+		self.assertRaises(frappe.PermissionError, setup_if_missing)
+
+	def test_hr_user_can_set_regime_for_other_employee(self):
+		employee = make_employee("ip_trs_hr_target@indiapayroll.com", company=COMPANY)
+		ssa = make_draft_assignment(employee)
+		hr_user = make_hr_user()
+
+		frappe.set_user(hr_user)
+		set_tax_regime(employee, NEW_REGIME_SLAB)
+		self.assertTrue(get_employee_details(employee)["annual_gross"])
+
+		frappe.set_user("Administrator")
 		self.assertEqual(
 			frappe.db.get_value("Salary Structure Assignment", ssa.name, "income_tax_slab"),
 			NEW_REGIME_SLAB,
