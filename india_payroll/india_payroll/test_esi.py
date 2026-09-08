@@ -69,6 +69,7 @@ class TestESI(HRMSTestSuite):
 			"test_esi_net_pay@indiapayroll.com",
 			"test_esi_lop_eligibility@indiapayroll.com",
 			"test_esi_lop_contribution@indiapayroll.com",
+			"test_esi_missing_employer_component@indiapayroll.com",
 		]
 		create_esi_components()
 		self._ensure_esi_test_components()
@@ -185,6 +186,33 @@ class TestESI(HRMSTestSuite):
 		]
 		self.assertEqual(len(employer_rows), 1, "Employer ESI contribution row must be present")
 		self.assertAlmostEqual(employer_rows[0].amount, flt(gross * EMPLOYER_ESI_RATE, 2), places=2)  # 487.50
+
+	@HRMSTestSuite.change_settings("Payroll Settings", {"enable_esic": 1})
+	def test_employee_esi_applied_when_employer_component_missing(self):
+		"""
+		The employee's 0.75% deduction must not depend on the employer component.
+		A site missing "Employer State Insurance" still owes the employee share,
+		and gating both together silently dropped it from every slip.
+		"""
+		frappe.db.delete("Salary Component", {"name": ESI_EMPLOYER_COMPONENT})
+		self.assertFalse(frappe.db.exists("Salary Component", ESI_EMPLOYER_COMPONENT))
+
+		gross = 15_000.0
+		_, salary_slip = self._make_salary_slip(
+			"test_esi_missing_employer_component@indiapayroll.com",
+			"Test ESI Missing Employer Structure",
+			gross,
+		)
+		salary_slip.insert()
+
+		emp_rows = [d for d in salary_slip.deductions if d.salary_component == ESI_EMPLOYEE_COMPONENT]
+		self.assertEqual(len(emp_rows), 1, "Employee ESI must apply without the employer component")
+		self.assertAlmostEqual(emp_rows[0].amount, flt(gross * EMPLOYEE_ESI_RATE, 2), places=2)
+
+		employer_rows = [
+			d for d in salary_slip.employer_contributions if d.salary_component == ESI_EMPLOYER_COMPONENT
+		]
+		self.assertEqual(len(employer_rows), 0, "No employer row without the component")
 
 	@HRMSTestSuite.change_settings("Payroll Settings", {"enable_esic": 1})
 	def test_employee_at_exact_ceiling_is_eligible(self):

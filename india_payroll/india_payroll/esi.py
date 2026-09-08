@@ -53,7 +53,7 @@ def apply_esi(doc, method=None) -> None:
 	if not doc.salary_structure:
 		return
 
-	if not _required_components_exist():
+	if not _employee_component_exists():
 		return
 
 	# the PwD flag decides which ceiling applies
@@ -72,20 +72,17 @@ def apply_esi(doc, method=None) -> None:
 	_update_esi_in_salary_slip(doc, split)
 
 
-def _required_components_exist() -> bool:
-	missing = [
-		component
-		for component in (ESI_EMPLOYEE_COMPONENT, ESI_EMPLOYER_COMPONENT)
-		if not frappe.db.exists("Salary Component", component)
-	]
-	if not missing:
+def _employee_component_exists() -> bool:
+	"""Only the employee component gates the deduction. The employer component is
+	written elsewhere, so a missing one must not stop the employee's share."""
+	if frappe.db.exists("Salary Component", ESI_EMPLOYEE_COMPONENT):
 		return True
 
 	frappe.msgprint(
 		frappe._(
 			"Salary Component <b>{0}</b> not found. "
 			"Please reinstall the India Payroll app or create it manually."
-		).format(", ".join(missing)),
+		).format(ESI_EMPLOYEE_COMPONENT),
 		indicator="orange",
 		alert=True,
 	)
