@@ -110,3 +110,14 @@ class TestProfessionalTaxRegister(HRMSTestSuite):
 
 		self.assertIsNotNone(self._row_for(no_state.employee, {"deduction_status": "No PT State"}))
 		self.assertIsNone(self._row_for(deducted.employee, {"deduction_status": "No PT State"}))
+
+	def test_year_without_month_covers_the_whole_year(self):
+		self.assertEqual(
+			professional_tax_register._get_date_range({"year": "2026"}),
+			{"from_date": "2026-01-01", "to_date": "2026-12-31"},
+		)
+		self.assertEqual(
+			professional_tax_register._get_date_range({"year": "2026", "month": "February"}),
+			{"from_date": "2026-02-01", "to_date": "2026-02-28"},
+		)
+		self.assertIsNone(professional_tax_register._get_date_range({}))
