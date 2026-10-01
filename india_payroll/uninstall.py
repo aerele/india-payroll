@@ -2,6 +2,7 @@ import click
 import frappe
 
 from india_payroll.install import get_custom_fields
+from india_payroll.sidebar import remove_sidebar_links
 
 
 def before_uninstall():
@@ -17,6 +18,7 @@ def before_uninstall():
 	use. Mirrors india_compliance, which only removes customizations on uninstall."""
 	try:
 		delete_custom_fields()
+		remove_sidebar_links()
 	except Exception:
 		click.secho(
 			"Removing customizations for India Payroll failed due to an error. "

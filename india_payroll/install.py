@@ -2,6 +2,7 @@ import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
 from india_payroll.india_payroll.tax_exemption_setup import setup_tax_exemption_categories
+from india_payroll.sidebar import add_sidebar_links
 from india_payroll.telemetry import record_install
 
 INDIA_STATES = [
@@ -627,11 +628,13 @@ def after_install():
 	# setup employment states
 	execute()
 
+	add_sidebar_links()
 	record_install()
 
 
 def after_migrate():
 	create_custom_fields(get_custom_fields())
+	add_sidebar_links()
 
 
 def create_professional_tax_component():
