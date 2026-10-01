@@ -16,26 +16,6 @@ const MONTHS = [
 	"December",
 ];
 
-// States that levy Professional Tax (must stay in sync with STATE_PT_CONFIG in professional_tax.py)
-const PT_STATES = [
-	"Andhra Pradesh",
-	"Assam",
-	"Bihar",
-	"Gujarat",
-	"Jharkhand",
-	"Karnataka",
-	"Kerala",
-	"Madhya Pradesh",
-	"Maharashtra",
-	"Meghalaya",
-	"Odisha",
-	"Sikkim",
-	"Tamil Nadu",
-	"Telangana",
-	"Tripura",
-	"West Bengal",
-];
-
 function _yearOptions() {
 	const current = new Date().getFullYear();
 	const options = [];
@@ -72,7 +52,6 @@ frappe.query_reports["Professional Tax Register"] = {
 			fieldname: "employment_state",
 			label: __("Employment State"),
 			fieldtype: "Select",
-			options: "\n" + PT_STATES.join("\n"),
 			description: __("Filter by employee employment state"),
 		},
 		{
@@ -98,6 +77,17 @@ frappe.query_reports["Professional Tax Register"] = {
 	},
 
 	onload(report) {
+		// offer every state an assignment can have, including those without PT
+		frappe.model.with_doctype("Salary Structure Assignment", () => {
+			const field = frappe.meta.get_docfield(
+				"Salary Structure Assignment",
+				"employment_state"
+			);
+			const filter = report.get_filter("employment_state");
+			filter.df.options = "\n" + (field?.options || "");
+			filter.refresh();
+		});
+
 		report.page.add_inner_button(__("Export for PT Remittance"), () => {
 			const data = frappe.query_report.data;
 			if (!data || !data.length) {
@@ -117,7 +107,11 @@ frappe.query_reports["Professional Tax Register"] = {
 				"Deduction Status",
 			];
 
-			const quote = (value) => `"${(value || "").replace(/"/g, '""')}"`;
+			// a leading =, +, - or @ makes spreadsheets read the text as a formula
+			const quote = (value) => {
+				const text = (value || "").replace(/^[=+\-@]/, "'$&");
+				return `"${text.replace(/"/g, '""')}"`;
+			};
 			const csvRows = [headers.join(",")];
 			data.forEach((row) => {
 				csvRows.push(

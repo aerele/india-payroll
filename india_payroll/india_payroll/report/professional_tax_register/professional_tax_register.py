@@ -130,6 +130,7 @@ def get_data(filters):
 			SS.employee,
 			SS.employee_name,
 			SS.start_date,
+			SS.end_date,
 			SS.salary_structure,
 			SS.company,
 			SS.currency,
@@ -154,13 +155,13 @@ def get_data(filters):
 
 	data = []
 	for row in rows:
-		# The employment state lives on the Salary Structure Assignment effective
-		# for the slip's period, the same one apply_professional_tax reads.
+		# The employment state lives on the Salary Structure Assignment effective on
+		# the slip's end date, the same one apply_professional_tax reads.
 		employment_state = get_effective_ssa_values(
 			row.employee,
 			row.company,
 			row.salary_structure,
-			row.start_date,
+			row.end_date,
 			["employment_state"],
 		).get("employment_state")
 
@@ -243,18 +244,22 @@ def _get_date_range(filters):
 
 	Priority:
 	  1. Month + Year  (single month)
-	  2. No date filter (all submitted slips)
+	  2. Year           (whole calendar year)
+	  3. No date filter (all submitted slips)
 	"""
 	year = filters.get("year")
 	month_name = filters.get("month")
 
-	if year and month_name and month_name in _MONTHS:
+	if not year:
+		return None
+
+	year_int = int(year)
+	if month_name in _MONTHS:
 		month_num = _MONTHS[month_name]
-		year_int = int(year)
 		last_day = calendar.monthrange(year_int, month_num)[1]
 		return {
 			"from_date": f"{year_int:04d}-{month_num:02d}-01",
 			"to_date": f"{year_int:04d}-{month_num:02d}-{last_day:02d}",
 		}
 
-	return None
+	return {"from_date": f"{year_int:04d}-01-01", "to_date": f"{year_int:04d}-12-31"}
